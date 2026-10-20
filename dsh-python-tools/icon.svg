@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Python Tools">
+  <title>Python Tools</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d3557"/>
+      <stop offset="1" stop-color="#0b1a2b"/>
+    </linearGradient>
+    <linearGradient id="snake" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4ec3e0"/>
+      <stop offset="1" stop-color="#2b8fd6"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#tile)"/>
+  <!-- 两条交叠的蛇形块：Python 的经典意象，但用几何块表达，不复制任何官方标志 -->
+  <path d="M30 12h-8a7 7 0 0 0-7 7v6a7 7 0 0 0 7 7h9v4h-6" fill="none" stroke="url(#snake)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34 52h8a7 7 0 0 0 7-7v-6a7 7 0 0 0-7-7h-9v-4h6" fill="none" stroke="#f0b429" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 右边一个「接口插槽」：说明这里接的是外部工具 -->
+  <circle cx="47" cy="14" r="3.2" fill="#f0b429"/>
+  <circle cx="17" cy="50" r="3.2" fill="#4ec3e0"/>
+</svg>
