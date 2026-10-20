@@ -1,10 +1,11 @@
 # Python Tools (DSH Plugin)
 
-[中文 README](https://github.com/egsfggr22222/dsh-python-tools/blob/main/dsh-python-tools/README.md)
+**中文 README:** [中文 README](https://github.com/egsfggr22222/dsh-python-tools/blob/main/dsh-python-tools/README.md)
 
-**This plugin has no features of its own.** It does exactly one thing: turn Python files into DSH tools and skills.
+**This plugin has no features of its own.** It does one simple thing: turn Python files into DSH tools and skills.
 
-Any `.py` file that calls `pytools_client.register()` declares tools to DSH. The plugin remembers where the file lives, calls its registered interfaces whenever needed, receives the data and feedback it returns, and monitors its location in real time — move or rename the file, and the plugin immediately knows the new location.
+Any `.py` file that calls `pytools_client.register()` declares tools to DSH.
+The plugin remembers where the file lives, calls its registered interfaces whenever needed, receives the data and feedback it returns, and monitors its location in real time — move or rename the file, and the plugin immediately knows the new location.
 
 ```
 You write a .py  ──pytools install──►  plugin remembers its location  ──►  each register() function becomes a DSH tool
@@ -13,9 +14,9 @@ You write a .py  ──pytools install──►  plugin remembers its location  
          └──────────────── JSON args in / data frames · result frames out ◄────────┘
 ```
 
-## Not a toy: what it can put inside DSH
+## What it can put inside DSH
 
-The plugin is just a channel. And when the channel is open, **everything in the Python ecosystem can become a DSH tool**.
+The plugin is just a channel. When the channel is open, **things in the Python ecosystem can become DSH tools**.
 
 Concretely, once installed, DSH can:
 
@@ -56,7 +57,8 @@ def train_status(job: str) -> dict:
 def train_stop(job: str) -> dict: ...
 ```
 
-Now DSH can: start → poll every few seconds → stop immediately if loss plateaus → evaluate the final weights. In between, `ctx.emit()` pushes per-epoch metrics back in real time.
+Now DSH can: start → poll every few seconds → stop immediately if loss plateaus → evaluate the final weights.
+In between, `ctx.emit()` pushes per-epoch metrics back in real time.
 
 GPU, CUDA, multi-GPU — none of that matters here. That's the Python side's business; the plugin doesn't touch it.
 
@@ -73,17 +75,13 @@ GPU, CUDA, multi-GPU — none of that matters here. That's the Python side's bus
 
 ### Real-world examples
 
-These three are in active use, not hypothetical:
-
 | Project | What it does |
 |---|---|
-| **blackboard** | a window you can draw on: 14 tools driving a frameless canvas, frame-by-frame animation, walkthroughs, Q&A, archiving |
+| **blackboard** | a window you can draw on: 14 tools driving a frameless canvas, frame-by-frame animation, walkthrough progress, Q&A, archiving |
 | **whale host** | subtitles + speech + directory probing: a Qt floating window, offline TTS, per-character pacing, tree-shaped maps |
 | **probe-tree** | map a directory's size and structure first, so the agent avoids large files and doesn't waste context |
 
-So the point of this plugin isn't "it can run Python scripts" — it's:
-
-> **As big as the Python ecosystem is, that's how big DSH's capability boundary becomes.**
+So the point of this plugin is to extend the Python ecosystem into DSH.
 
 Write a `.py`, register it once, and it takes effect immediately — no restart, no plugin code changes.
 
@@ -196,7 +194,8 @@ def my_tool(a: int, b: str = "x") -> dict:
 
 `register` also supports the direct-call form `register(fn, description=...)`, a custom name `name="kebab-case"`, a hand-written schema `schema={...}`, incremental overrides `parameters={...}`, and a timeout `timeout=600`.
 
-Parameter schema derivation order: type annotations → the `Args:` section of the docstring → hand-written overrides. A `ToolContext` parameter won't appear in the schema — that's how the function gets its context.
+Parameter schema derivation order: type annotations → the `Args:` section of the docstring → hand-written overrides.
+A `ToolContext` parameter won't appear in the schema — that's how the function gets its context.
 
 ### 2. Register skills
 
@@ -432,7 +431,4 @@ Interpreter lookup order: specified at registration → `PYTOOLS_PYTHON` → `PY
 - One call, one process, no resident state; need state, write it to files (see `examples/screen_watch.py`).
 - Relative paths resolve against the file's directory (the plugin uses that as the working directory).
 - Result-frame cap is 8 MB; stream frames keep the most recent 500.
-- The built-in examples (the two in `examples/`) don't appear in the settings panel and can't be disabled or deleted: they're self-check baselines.
-
-## License
-```
+- The built-in examples (the two in `examples/`) don't appear in the settings panel and can't be disabled or deleted: 
