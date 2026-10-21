@@ -1,0 +1,48 @@
+{
+  "name": "dsh-python-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Python Tools —— 一个「自己没有功能」的插件：任何 Python 文件调用 pytools.register() 即可把自己的函数变成 DSH tool、把 markdown 变成 skill；插件记住每个已安装 Python tools 的位置，随时调用它注册的接口，接收它的回传数据和反馈，并实时监控文件位置变化。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg",
+    "./pytools_client.py": "./pytools_client.py"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "pytools_client.py",
+    "skills/pytools-authoring.md",
+    "skills/pytools-offline-protocol.md",
+    "examples/echo_tools.py",
+    "examples/screen_watch.py",
+    "icon.svg",
+    "README.md",
+    "README.zh.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "python",
+    "tools",
+    "skills",
+    "dsh-python-tools",
+    "Python Tools"
+  ]
+}
