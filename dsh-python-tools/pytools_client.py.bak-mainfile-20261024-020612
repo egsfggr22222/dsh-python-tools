@@ -1,0 +1,1830 @@
+"""pytools_client —— 神经：DSH（大脑）与 Python（手）之间只传指令和数据的通道。
+
+一句话
+======
+大脑下指令、给数据；Python 进程用任何库把事情做掉；反馈由 Python 那边自己
+设计、自己回传。本库只做「传输」，不做业务判断。
+
+这个文件就是「神经」本身
+------------------------
+它既是 DSH 的 Python Tools 插件的客户端库，也是一个**可以 import 的普通 Python 包**：
+
+    import pytools_client as pt
+
+    @pt.register(description="把两数相加")
+    def add(a: int, b: int) -> dict:
+        return {"sum": a + b}
+
+    if __name__ == "__main__":
+        raise SystemExit(pt.main())
+
+不需要 pip 安装，也不需要插件注入 PYTHONPATH —— 本文件会把自己所在目录
+（以及几个常见位置）自动挂到 ``sys.path``，所以在任何解释器里 import 都不会失联。
+
+支持的 Python
+-------------
+Python 3.8 及以上（Windows / Linux / macOS）。所有注解兼容 ``X | Y``、
+``list[str]``、``typing.Union`` 等写法在 3.8 下的差异。
+
+协议（pytools/2，向下兼容 pytools/1）
+------------------------------------
+四个文件，只有文件，没有端口、没有常驻服务：
+
+    <callId>.call.json    DSH → Python   指令：哪个工具、什么参数
+    <callId>.stream.log   Python → DSH   数据帧：进度 / 事件 / 提问 / 日志
+    <callId>.result.json  Python → DSH   结果：返回值或错误
+    <callId>.reply.json   DSH → Python   回答：对「提问帧」的答复
+
+帧类型（kind）
+--------------
+    data      任意 JSON：普通数据；可用 ``dataType`` 说明这是什么数据
+    log       {"level", "message"}
+    progress  {"value": 0..1, "message"}；带 ``actionId`` 时表示某个动作的进度
+    event     任意 JSON：Python 主动推的事件（普通反馈）
+    ack       {"actionId"}                 收到动作了
+    result    {"actionId", "ok", "value"?} 动作做完了
+    done      {"ok": bool}                 本次调用的结束标记
+
+数据和动作是两回事
+------------------
+**数据**描述「这是什么」：``ctx.emit(payload, kind="data", dataType="table.stats")``
+只是告诉大脑这段数据的类型，插件不做任何解释。
+
+**动作**描述「去做什么」：每条动作有唯一 ``actionId``，可以带反馈回来。
+
+    DSH → Python   把动作写进这个文件的邮箱（~/.dsh/python-tools/actions/）
+    Python → DSH   用 ``pytools.act(...)`` 申请一个动作
+
+Python 收到动作时，如果没有对应处理函数，插件不干预 —— 由创作者自己决定
+（比如回一条 ``no function``）。插件只负责把动作送到、把反馈带走。
+
+杀掉进程
+--------
+``pytools kill`` / DSH 的停止按钮会把 python 子进程直接结束；这是硬停止，
+Python 那边没有收尾机会。需要收尾就用 ``follow_lifecycle`` 或自己写守护逻辑。
+
+命令行
+------
+    python your_tools.py                  打印名片
+    python your_tools.py --manifest       清单 JSON（插件读）
+    python your_tools.py --list           一行一条（给人看）
+    python your_tools.py --skill <name>   技能正文
+    python your_tools.py --doctor         自检：解释器、路径、协议、平台
+    python your_tools.py __pytools_call__ 执行一次调用
+    python your_tools.py __pytools_serve__  常驻会话：从 stdin 收指令，向 stdout 回帧
+"""
+
+from __future__ import annotations  # noqa: E402  (必须紧跟模块 docstring)
+
+import sys
+
+# ── 自定位：先把自己钉在 sys.path 上，后面所有 import 才稳 ──────────────────
+# 插件通常会用 PYTHONPATH / PYTOOLS_CLIENT_DIR 告诉子进程本库在哪；但某些启动
+# 方式（桌面快捷方式、GUI 宿主、systemd 单元）里这些变量到不了子进程。这里兜底，
+# 保证「无论谁用哪个解释器启动，import pytools_client 都不会失联」。
+
+
+def _ensure_importable():
+    import os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [here]
+    for key in ("PYTOOLS_CLIENT_DIR", "PYTOOLS_HOME"):
+        value = os.environ.get(key)
+        if value:
+            candidates.append(value)
+    for part in (os.environ.get("PYTHONPATH") or "").split(os.pathsep):
+        if part.strip():
+            candidates.append(part.strip())
+    candidates.append(os.path.join(os.path.expanduser("~"), ".dsh", "python-tools"))
+    for folder in candidates:
+        if folder and os.path.isfile(os.path.join(folder, "pytools_client.py")):
+            if folder not in sys.path:
+                sys.path.insert(0, folder)
+            return folder
+    return here
+
+
+__pytools_home__ = _ensure_importable()
+
+import inspect  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import platform  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import traceback  # noqa: E402
+import typing  # noqa: E402
+import uuid  # noqa: E402
+from typing import Any, Callable, Dict, Iterable, List, Optional  # noqa: E402
+
+__all__ = [
+    "ToolContext",
+    "DshBridge",
+    "register",
+    "skill",
+    "describe",
+    "follow_lifecycle",
+    "lifecycle_event",
+    "interrupt",
+    "send_message",
+    "notify",
+    "state_dir",
+    "read_json",
+    "write_json",
+    "read_lines",
+    "append_line",
+    "pid_alive",
+    "spawn_background",
+    "kill_process",
+    "file_stamp",
+    "watch_file",
+    "wait_until",
+    "current_context",
+    "emit",
+    "log",
+    "actions_dir",
+    "action_mailbox",
+    "poll_actions",
+    "act",
+    "ack",
+    "action_result",
+    "doctor",
+    "serve",
+    "main",
+    "ProtocolError",
+    "VERSION",
+    "PROTOCOL",
+]
+
+VERSION = "2.0.0"
+PROTOCOL = "pytools/2"
+_COMPAT_PROTOCOLS = ("pytools/1", "pytools/2")
+
+# 协议常量：与 index.js 保持一致。
+_CLI_SUBCOMMAND = "__pytools_call__"
+_SERVE_SUBCOMMAND = "__pytools_serve__"
+_FRAME_BEGIN = "PYTOOLS-FRAME-BEGIN"
+_ENV_CALL_FILE = "PYTOOLS_CALL_FILE"
+_ENV_RESULT_FILE = "PYTOOLS_RESULT_FILE"
+_ENV_STREAM_FILE = "PYTOOLS_STREAM_FILE"
+_ENV_REPLY_FILE = "PYTOOLS_REPLY_FILE"
+_ENV_CALL_ID = "PYTOOLS_CALL_ID"
+
+
+class ProtocolError(Exception):
+    """调用帧、结果帧不合法时抛出。"""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 一、跨平台小工具（Windows / Linux / macOS）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _pid_alive(pid: Any) -> bool:
+    """进程是否还活着。三个平台各用各的办法，互不依赖外部命令的格式。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if _is_windows():
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                capture_output=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return str(pid).encode() in (out.stdout or b"")
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)  # Linux / macOS：信号 0 只探测不发送
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但不属于我们
+    except OSError:
+        return False
+
+
+def _detached_flags() -> Dict[str, Any]:
+    """让子进程脱离当前终端/会话，宿主退出也不连带杀掉。"""
+    if _is_windows():
+        return {
+            "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+    return {"start_new_session": True}
+
+
+def _hidden_flags() -> Dict[str, Any]:
+    """只需要「不弹黑窗」，不需要脱离会话。"""
+    if _is_windows():
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
+def _python_exe() -> str:
+    return sys.executable or ("python" if _is_windows() else "python3")
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """先写临时文件再改名：读的一方不会看到半个文件。"""
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = path + ".%d.%s.tmp" % (os.getpid(), uuid.uuid4().hex[:8])
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def _read_json_file(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 二、注解兼容层（3.8 ~ 3.13 一视同仁）
+# ══════════════════════════════════════════════════════════════════════════
+
+_ANNOTATION_TYPES = {
+    "int": ("integer", int),
+    "float": ("number", float),
+    "str": ("string", str),
+    "bool": ("boolean", bool),
+    "list": ("array", list),
+    "dict": ("object", dict),
+    "tuple": ("array", tuple),
+    "set": ("array", set),
+    "None": ("null", type(None)),
+}
+
+# 允许注解里出现的名字：只做「查表」，绝不 eval 任意表达式。
+_ANNOTATION_TOKENS = {name: value for name, (_, value) in _ANNOTATION_TYPES.items()}
+_ANNOTATION_TOKENS.update({"List": list, "Dict": dict, "Tuple": tuple, "Set": set, "Any": object})
+
+
+def _union_args(annotation: Any) -> Optional[List[Any]]:
+    """取出 ``Optional[X]`` / ``Union[X, Y]`` / ``X | Y`` 里的成员；不是联合类型就返回 None。"""
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union:
+        return list(typing.get_args(annotation) or [])
+    # Python 3.10+ 的 X | Y 会产生 types.UnionType，get_origin 可能返回 types.UnionType
+    union_type = getattr(__import__("types"), "UnionType", None)
+    if union_type is not None and (origin is union_type or isinstance(annotation, union_type)):
+        return list(typing.get_args(annotation) or [])
+    return None
+
+
+def _annotation_schema(annotation: Any) -> Dict[str, Any]:
+    """把类型注解翻译成 JSON Schema 的一小片。"""
+    if annotation is inspect.Parameter.empty or annotation is Any:
+        return {}
+    if annotation is type(None):
+        return {"type": "null"}
+    if isinstance(annotation, str):
+        # from __future__ import annotations 下注解是字符串：只做安全查表
+        text = annotation.strip()
+        parts = _union_args(_parse_light_union(text))
+        if parts is not None:
+            resolved = [x for x in parts if x is not type(None)]
+            schema = _annotation_schema(resolved[0]) if len(resolved) == 1 else {}
+            if len(parts) != len(resolved):
+                schema = dict(schema)
+                schema["nullable"] = True
+            return schema
+        base = _ANNOTATION_TOKENS.get(text)
+        if base is None:
+            # list[str] / dict[str, int] 之类：取外层
+            head = re.split(r"[\[\(]", text, maxsplit=1)[0].strip()
+            base = _ANNOTATION_TOKENS.get(head)
+        if base is None:
+            return {}
+        for name, (kind, cls) in _ANNOTATION_TYPES.items():
+            if cls is base:
+                return {"type": kind}
+        return {}
+    parts = _union_args(annotation)
+    if parts is not None:
+        resolved = [item for item in parts if item is not type(None)]
+        schema = _annotation_schema(resolved[0]) if len(resolved) == 1 else {}
+        if len(parts) != len(resolved):
+            schema = dict(schema)
+            schema["nullable"] = True
+        return schema
+    try:
+        for name, (kind, cls) in _ANNOTATION_TYPES.items():
+            if annotation is cls:
+                return {"type": kind}
+        if isinstance(annotation, type) and issubclass(annotation, (list, tuple, set)):
+            return {"type": "array"}
+        if isinstance(annotation, type) and issubclass(annotation, dict):
+            return {"type": "object"}
+        if isinstance(annotation, type) and getattr(annotation, "__members__", None):
+            return {"type": "string", "enum": list(annotation.__members__)}
+    except TypeError:
+        return {}
+    return {}
+
+
+def _parse_light_union(text: str) -> Any:
+    """把 ``Optional[int]`` / ``int | None`` 这类字符串安全地拆成成员列表。
+
+    只识别本模块白名单里的名字，其余返回 ``inspect.Parameter.empty``；不执行任何代码。
+    """
+    inner = text
+    match = re.match(r"^Optional\[(.*)\]$", text)
+    if match:
+        return typing.Optional[_ANNOTATION_TOKENS.get(match.group(1).strip(), object)]
+    match = re.match(r"^Union\[(.*)\]$", text)
+    if match:
+        return typing.Union[
+            tuple(_ANNOTATION_TOKENS.get(part.strip(), object) for part in match.group(1).split(","))
+        ]
+    if "|" in text:
+        members = []
+        for part in text.split("|"):
+            part = part.strip()
+            if part == "None":
+                members.append(type(None))
+            else:
+                members.append(_ANNOTATION_TOKENS.get(part, object))
+        inner = None
+        return typing.Union[tuple(members)]
+    return inspect.Parameter.empty
+
+
+def _resolved_hints(fn: Callable[..., Any]) -> Dict[str, Any]:
+    """拿到函数注解；失败就退回原始注解，绝不因为一个奇怪注解炸掉整个声明。"""
+    try:
+        return typing.get_type_hints(fn)
+    except Exception:
+        return dict(getattr(fn, "__annotations__", {}) or {})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 三、工具上下文（Python 侧对大脑的「神经末梢」）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _jsonable(value: Any) -> Any:
+    """把任意返回值化成可 JSON 的形式（dataclass / namedtuple / bytes / set ...）。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            import base64
+
+            return base64.b64encode(value).decode("ascii")
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    for method in ("to_dict", "_asdict", "model_dump", "dict"):
+        if callable(getattr(value, method, None)):
+            try:
+                return _jsonable(getattr(value, method)())
+            except Exception:
+                continue
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        try:
+            return {str(k): _jsonable(v) for k, v in vars(value).items() if not k.startswith("_")}
+        except TypeError:
+            pass
+    return repr(value)
+
+
+class DshBridge:
+    """Python 这一侧的 DSH 出口。
+
+    只做传输，不解释内容：
+
+    * :meth:`emit` —— 推一帧数据回大脑（普通反馈）；
+    * :meth:`notify` —— 弹一条给人看的通知；
+    * :meth:`log` —— 记一条日志；
+    * :meth:`act` —— 申请一个动作（带 actionId）。
+
+    没有 ``ask`` / ``call``：历史上这两个方法存在但宿主从未实现，调用必然抛错，
+    已经移除。需要「问了再继续」的逻辑，请用动作 + 反馈自己组合。
+    """
+
+    def __init__(self, ctx: "ToolContext") -> None:
+        self._ctx = ctx
+
+    def emit(self, event: Any, *, kind: str = "data", dataType: str = "") -> None:
+        self._ctx.emit(event, kind=kind, dataType=dataType)
+
+    def event(self, event: Any) -> None:
+        """Python 主动推一条事件（普通反馈，不阻塞）。"""
+        self._ctx.emit(event, kind="event")
+
+    def notify(self, text: str) -> None:
+        self._ctx.emit(str(text), kind="notify")
+
+    def log(self, level: str, message: str) -> None:
+        self._ctx.emit({"level": level, "message": str(message)}, kind="log")
+
+    def act(self, name: str, arguments: Optional[Dict[str, Any]] = None, *,
+            action_id: str = "", note: str = "") -> Dict[str, Any]:
+        """:meth:`ToolContext.act` 的桥接版本。"""
+        return self._ctx.act(name, arguments or {}, action_id=action_id, note=note)
+
+    @property
+    def call_id(self) -> str:
+        return self._ctx.frame.get("callId", "")
+
+    @property
+    def tool_name(self) -> str:
+        return self._ctx.frame.get("tool", "")
+
+    @property
+    def dsh_name(self) -> str:
+        return self._ctx.frame.get("dshName", "") or self._ctx.frame.get("tool", "")
+
+    @property
+    def file(self) -> str:
+        return self._ctx.frame.get("file", "")
+
+    @property
+    def call_arguments(self) -> Dict[str, Any]:
+        return dict(self._ctx.frame.get("arguments") or {})
+
+    @property
+    def registered(self) -> bool:
+        return bool(self._ctx.frame)
+
+
+class ToolContext:
+    """传给工具函数的上下文（``ctx``）。
+
+    工具函数声明一个注解为 :class:`ToolContext`（或直接命名为 ``ctx`` / ``context``）
+    的参数，就会拿到它；它不会出现在给大脑看的参数表里。
+    """
+
+    _current: "Optional[ToolContext]" = None
+
+    @classmethod
+    def current_context(cls) -> "Optional[ToolContext]":
+        return cls._current
+
+    @classmethod
+    def require(cls) -> "ToolContext":
+        ctx = cls._current
+        if ctx is None:
+            raise RuntimeError("没有当前工具上下文：这段代码不在一次 pytools 调用里运行")
+        return ctx
+
+    def __init__(
+        self,
+        frame: Optional[Dict[str, Any]] = None,
+        stream_path: Optional[str] = None,
+        reply_path: Optional[str] = None,
+    ) -> None:
+        self.frame: Dict[str, Any] = frame or {}
+        self.stream_path = stream_path
+        self.reply_path = reply_path
+        self._seq = 0
+        self._stream = None
+        self._ask_seq = 0
+        self.events: List[Dict[str, Any]] = []
+        self.dsh = DshBridge(self)
+
+    # ── 流 ──
+    def _open_stream(self):
+        if self._stream is not None:
+            return self._stream
+        if not self.stream_path:
+            return None
+        try:
+            self._stream = open(self.stream_path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            self._stream = None
+        return self._stream
+
+    def emit(self, payload: Any, /, *, kind: str = "data", dataType: str = "") -> None:
+        """写一帧到流出。任何时候都能调用，包括异常处理里。
+
+        ``dataType`` 只对 ``kind="data"`` 有意义：它说明「这段数据是什么」，
+        例如 ``"table.stats"``、``"screenshot.bbox"``。插件原样转交，不做解释。
+        不传就和以前完全一样。
+        """
+        self._seq += 1
+        frame = {
+            "seq": self._seq,
+            "t": time.time(),
+            "kind": kind,
+            "payload": _jsonable(payload),
+        }
+        if dataType:
+            frame["dataType"] = str(dataType)
+        self.events.append(frame)
+        handle = self._open_stream()
+        if handle is None:
+            return
+        try:
+            handle.write(_FRAME_BEGIN + " " + json.dumps(frame, ensure_ascii=False) + "\n")
+            handle.flush()
+        except (OSError, ValueError):
+            pass
+
+    def log(self, message: str, level: str = "info") -> None:
+        self.emit({"level": level, "message": str(message)}, kind="log")
+
+    def progress(self, value: float, message: str = "") -> None:
+        """上报进度，``value`` 取 0..1（也接受 0..100，自动归一）。"""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = 0.0
+        if number > 1.0:
+            number = number / 100.0
+        self.emit({"value": max(0.0, min(1.0, number)), "message": str(message)}, kind="progress")
+
+    def event(self, payload: Any) -> None:
+        """推一条普通事件（与 data 的区别只是语义：这是「喂给大脑的反馈」）。"""
+        self.emit(payload, kind="event")
+
+    def act(self, name: str, arguments: Optional[Dict[str, Any]] = None, *,
+            action_id: str = "", note: str = "") -> Dict[str, Any]:
+        """申请一个动作：请求 DSH 去做一件事。只写申请，不等结果。
+
+        这是「动作」而不是「数据」：它带一个 ``actionId``，DSH 收到后可以回
+        ``ack`` / ``result``，也可以直接不管。插件只负责送到，不保证被处理。
+
+        Args:
+            name: 动作名，例如 ``"open_panel"``。DSH 侧按名字自己决定做什么。
+            arguments: 动作参数（任意 JSON）。
+            action_id: 自定义 id；不传就自动生成。
+            note: 给人看的说明。
+
+        Returns:
+            写进去的申请记录（含 ``actionId``）。
+        """
+        act_id = str(action_id or "") or "act_%s" % uuid.uuid4().hex[:12]
+        record = _emit_request("action", {
+            "actionId": act_id,
+            "name": str(name or ""),
+            "arguments": _jsonable(dict(arguments or {})),
+            "note": str(note or ""),
+        })
+        record["actionId"] = act_id
+        return record
+
+    def ack(self, action_id: str, value: Any = None) -> None:
+        """回报「收到了某个动作」。"""
+        self.emit({"actionId": str(action_id), "value": _jsonable(value)}, kind="ack")
+
+    def action_result(self, action_id: str, ok: bool = True, value: Any = None,
+                      error: Any = None) -> None:
+        """回报「某个动作做完了」。失败就把 error 带上。"""
+        payload: Dict[str, Any] = {"actionId": str(action_id), "ok": bool(ok)}
+        if value is not None:
+            payload["value"] = _jsonable(value)
+        if error is not None:
+            payload["error"] = _jsonable(error)
+        self.emit(payload, kind="result")
+
+    def action_progress(self, action_id: str, value: float, message: str = "") -> None:
+        """回报某个动作的进度（0..1）。"""
+        number = max(0.0, min(1.0, float(value)))
+        self.emit({"actionId": str(action_id), "value": number, "message": str(message)},
+                  kind="progress")
+
+    # 便利属性
+    @property
+    def call_id(self) -> str:
+        return self.frame.get("callId", "")
+
+    @property
+    def session_id(self) -> str:
+        return self.frame.get("sessionId", "")
+
+    @property
+    def tool_name(self) -> str:
+        return self.frame.get("tool", "")
+
+    @property
+    def dsh_name(self) -> str:
+        return self.frame.get("dshName", "") or self.frame.get("tool", "")
+
+    @property
+    def file(self) -> str:
+        return self.frame.get("file", "")
+
+    @property
+    def call_arguments(self) -> Dict[str, Any]:
+        return dict(self.frame.get("arguments") or {})
+
+    @property
+    def registered(self) -> bool:
+        return bool(self.frame)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.flush()
+                self._stream.close()
+            except OSError:
+                pass
+            self._stream = None
+
+
+def current_context() -> Optional[ToolContext]:
+    return ToolContext._current
+
+
+def emit(event: Any, *, kind: str = "data", dataType: str = "") -> None:
+    """推一帧数据回大脑。``dataType`` 说明这段数据是什么（可省略）。"""
+    ctx = ToolContext._current
+    if ctx is None:
+        raise RuntimeError("emit() 必须在一次工具调用里使用（没有当前上下文）")
+    ctx.emit(event, kind=kind, dataType=dataType)
+
+
+def act(name: str, arguments: Optional[Dict[str, Any]] = None, *,
+        action_id: str = "", note: str = "") -> Dict[str, Any]:
+    """申请一个动作（不需要 ctx 的快捷方式）。只写申请，不等结果。"""
+    act_id = str(action_id or "") or "act_%s" % uuid.uuid4().hex[:12]
+    record = _emit_request("action", {
+        "actionId": act_id,
+        "name": str(name or ""),
+        "arguments": _jsonable(dict(arguments or {})),
+        "note": str(note or ""),
+    })
+    record["actionId"] = act_id
+    return record
+
+
+def ack(action_id: str, value: Any = None) -> None:
+    """回报「收到了某个动作」。"""
+    ctx = ToolContext._current
+    if ctx is None:
+        raise RuntimeError("ack() 必须在一次工具调用里使用（没有当前上下文）")
+    ctx.ack(action_id, value)
+
+
+def action_result(action_id: str, ok: bool = True, value: Any = None, error: Any = None) -> None:
+    """回报「某个动作做完了」。"""
+    ctx = ToolContext._current
+    if ctx is None:
+        raise RuntimeError("action_result() 必须在一次工具调用里使用（没有当前上下文）")
+    ctx.action_result(action_id, ok=ok, value=value, error=error)
+
+
+def log(message: str, level: str = "info") -> None:
+    ctx = ToolContext._current
+    if ctx is not None:
+        ctx.log(message, level)
+    else:
+        print("[pytools/%s] %s" % (level, message), file=sys.stderr)
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 四、注册表与声明
+# ══════════════════════════════════════════════════════════════════════════
+
+#: name -> 工具声明；顺序即声明顺序。
+TOOLS: "Dict[str, Dict[str, Any]]" = {}
+#: name -> 技能声明。
+SKILLS: "Dict[str, Dict[str, Any]]" = {}
+#: 本文件自己的描述（可选）。在模块顶层调用 :func:`describe`。
+FILE_INFO: Dict[str, Any] = {}#: 声明期收集到的「这样写会出问题」的提示，原样随清单交给 agent。
+WARNINGS: "List[str]" = []
+
+# 生命周期声明：调了 follow_lifecycle() 就置 True。
+# 置 True 后，agent 每轮结束（DSH 的 agent/status = idle）时，
+# 插件会以 --lifecycle agent-idle 再跑一次这个文件，让它自己收尾。
+LIFECYCLE: Dict[str, Any] = {"follow": False}
+
+
+def follow_lifecycle(enabled: bool = True) -> None:
+    """声明「agent 停下时请通知我」。
+
+    为什么需要：长驻进程（字幕、黑板）自己感知不到「用户把 agent 停了」，
+    而 agent 被中止后也没机会去通知它们。插件跟着 DSH 活着，能收到 agent 状态，
+    所以由它转一手。
+
+    声明之后，agent 每轮结束时插件会跑：
+
+        python 你的文件.py --lifecycle agent-idle
+
+    你只要在 main() 之前或 __main__ 里处理这个参数即可（见下面示例）。
+
+    示例：
+
+        from pytools_client import follow_lifecycle
+        follow_lifecycle()
+
+        if __name__ == "__main__":
+            event = pytools.lifecycle_event()
+            if event == "agent-idle":
+                do_cleanup()          # 自己收尾：停语音、清字幕……
+            else:
+                raise SystemExit(main())
+    """
+    LIFECYCLE["follow"] = bool(enabled)
+
+
+def lifecycle_event(argv: Optional[List[str]] = None) -> str:
+    """取 --lifecycle 参数的值；不是生命周期调用就返回空字符串。"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    for index, item in enumerate(args):
+        if item == "--lifecycle" and index + 1 < len(args):
+            return str(args[index + 1])
+        if item.startswith("--lifecycle="):
+            return item.split("=", 1)[1]
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  通用能力：反向通信
+#
+#  原则：Python 只能「申请」，不能直接做事。
+#  申请写进一个文件，插件读到后转交给 DSH，由 DSH 决定怎么做。
+#  插件只做通信层，不主动做任何事。
+#
+#  任何登记过的 .py 都能用这几个函数，不需要谁特别授权。
+# ══════════════════════════════════════════════════════════════════════════
+
+# 申请目录：~/.dsh/python-tools/requests/
+# 一个文件一个通道：<label>.jsonl
+REQUESTS: Dict[str, Any] = {"enabled": False}
+
+
+def _requests_dir() -> str:
+    root = os.environ.get("PYTOOLS_REQUESTS_DIR")
+    if root:
+        return root
+    home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+    return os.path.join(home, "python-tools", "requests")
+
+
+def _request_file() -> str:
+    """本文件对应的申请文件。文件名用主文件名，避免两个工具抢同一个。"""
+    main = _main_file() or "unknown"
+    stem = os.path.splitext(os.path.basename(main))[0] or "unknown"
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in stem)
+    return os.path.join(_requests_dir(), safe + ".jsonl")
+
+
+def _emit_request(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """写一条申请。只写文件，不保证对方已处理 —— 这是“申请”的本义。"""
+    item = {
+        "kind": kind,
+        "file": _main_file(),
+        "at": time.time(),
+        **payload,
+    }
+    path = _request_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return item
+
+
+def interrupt(reason: str = "") -> Dict[str, Any]:
+    """申请终止 agent 当前这一轮对话。
+
+    只写申请，不直接动手 —— 插件读到后交给 DSH，由 DSH 决定如何中断。
+
+    Args:
+        reason: 为什么请求中断，会原样带给 agent。
+
+    Returns:
+        写进去的申请记录。
+    """
+    return _emit_request("interrupt", {"reason": str(reason or "")})
+
+
+def send_message(text: str, interrupt: bool = False) -> Dict[str, Any]:
+    """申请给 agent 发一条消息。
+
+    Args:
+        text: 要交给 agent 的内容。
+        interrupt: True = 先申请中断当前对话，再看这条消息。
+
+    Returns:
+        写进去的申请记录。
+    """
+    body = str(text or "")
+    if not body.strip():
+        raise ValueError("send_message 的 text 不能为空")
+    return _emit_request("message", {"text": body, "interrupt": bool(interrupt)})
+
+
+def notify(text: str) -> Dict[str, Any]:
+    """申请弹一条面向人的通知（不进入对话）。"""
+    body = str(text or "")
+    if not body.strip():
+        raise ValueError("notify 的 text 不能为空")
+    return _emit_request("notify", {"text": body})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  通用能力：状态目录与文件
+# ══════════════════════════════════════════════════════════════════════════
+
+def state_dir(name: str = "") -> str:
+    """统一的工具状态目录（已创建）。
+
+    不传 name 就用本文件名，保证不同工具不会互相覆盖。
+    """
+    home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+    if not name:
+        main = _main_file() or "unknown"
+        name = os.path.splitext(os.path.basename(main))[0] or "unknown"
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(name))
+    path = os.path.join(home, "python-tools", "state", safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def actions_dir() -> str:
+    """动作邮箱所在目录（DSH -> Python 的「去做什么」）。
+
+    和 index.js 用同一套规则，所以两边一定指向同一个地方。
+    """
+    root = os.environ.get("PYTOOLS_ACTIONS_DIR")
+    if root:
+        return root
+    home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+    return os.path.join(home, "python-tools", "actions")
+
+
+def action_mailbox() -> str:
+    """本文件自己的动作邮箱（还没有就返回路径，不会创建）。"""
+    main = _main_file() or "unknown"
+    stem = os.path.splitext(os.path.basename(main))[0] or "unknown"
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in stem)
+    return os.path.join(actions_dir(), safe + ".jsonl")
+
+
+def poll_actions(reset: bool = False) -> "List[Dict[str, Any]]":
+    """取走 DSH 投给本文件、还没被读过的新动作。取走即推进游标，不会重复给。
+
+    这是「收话」的那一端。动作里有什么、要不要理，全由你自己决定；
+    不做任何事也不会报错 —— 插件只是把话送到。
+
+    Args:
+        reset: True = 从头开始读（忽略游标）。
+
+    Returns:
+        动作记录列表，每条含 ``actionId`` / ``name`` / ``arguments``。
+    """
+    mailbox = action_mailbox()
+    offset_file = os.path.join(state_dir(), "actions.offset")
+    offset = 0 if reset else int(read_json(offset_file, {}) .get("offset", 0) or 0)
+    if not os.path.isfile(mailbox):
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        size = os.path.getsize(mailbox)
+        if size <= offset:
+            return []
+        with open(mailbox, "r", encoding="utf-8") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+            new_offset = handle.tell()
+    except OSError:
+        return []
+    last_break = chunk.rfind("\n")
+    if last_break < 0:
+        return []
+    complete = chunk[: last_break + 1]
+    for line in complete.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    write_json(offset_file, {"offset": offset + len(complete.encode("utf-8"))})
+    return out
+
+
+def read_json(path: str, default: Any = None) -> Any:
+    """读 JSON；文件不存在或坏了就返回 default。"""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default if default is not None else {}
+
+
+def write_json(path: str, payload: Any) -> None:
+    """原子写 JSON（先写临时文件再换名，避免读到半个文件）。
+
+    payload 可以直接给对象，也可以给已经序列化好的 JSON 字符串
+    （很多旧代码习惯先 json.dumps 再写）。
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = json.dumps(payload, ensure_ascii=False)
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def read_lines(path: str) -> "List[Dict[str, Any]]":
+    """读一个 JSONL 文件，返回能解析的那些行。"""
+    if not os.path.isfile(path):
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict):
+                    out.append(item)
+    except OSError:
+        return []
+    return out
+
+
+def append_line(path: str, payload: Dict[str, Any]) -> None:
+    """往 JSONL 文件追加一行。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  通用能力：进程
+# ══════════════════════════════════════════════════════════════════════════
+
+def pid_alive(pid: Any) -> bool:
+    """进程还活着吗。
+
+    不调 tasklist（每次几毫秒到几十毫秒），直接用 OpenProcess，快一个数量级。
+    """
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    if _is_windows():
+        import ctypes
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, value)
+        if not handle:
+            return False
+        try:
+            # 已退出的进程也可能拿得到句柄（僵尸），再看一眼退出码
+            code = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            if ok and code.value != 259:      # 259 = STILL_ACTIVE
+                return False
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(value, 0)
+        return True
+    except OSError:
+        return False
+
+
+def spawn_background(argv: "List[str]", *, cwd: str = "", log: str = "") -> int:
+    """起一个脱离的常驻进程（本进程退出后它继续活）。返回 pid。
+
+    Args:
+        argv: 命令行，第一项是程序。
+        cwd: 工作目录；空就用当前目录。
+        log: 把 stdout/stderr 追写到这个文件；空就丢掉。
+    """
+    import subprocess
+
+    flags = _detached_flags()
+    kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "cwd": cwd or None,
+        **flags,
+    }
+    handle = None
+    if log:
+        os.makedirs(os.path.dirname(os.path.abspath(log)), exist_ok=True)
+        handle = open(log, "a", encoding="utf-8")
+        kwargs["stdout"] = handle
+        kwargs["stderr"] = handle
+    else:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        child = subprocess.Popen(list(argv), **kwargs)
+        return int(child.pid)
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def kill_process(pid: Any, *, timeout: float = 3.0) -> bool:
+    """精确杀掉一个进程（先温柔后强硬）。返回是否确认它已经没了。"""
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0 or not pid_alive(value):
+        return True
+    import signal as _signal
+    try:
+        os.kill(value, _signal.SIGTERM)
+    except Exception:
+        pass
+    deadline = time.time() + max(0.2, timeout)
+    while time.time() < deadline:
+        if not pid_alive(value):
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(value, 9)
+    except Exception:
+        pass
+    return not pid_alive(value)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  通用能力：盯文件 / 等条件
+# ══════════════════════════════════════════════════════════════════════════
+
+def file_stamp(path: str) -> float:
+    """文件的修改时间；不存在就是 0。"""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def watch_file(path: str, on_change: "Callable[[float], None]", *, interval: float = 0.4,
+               should_stop: "Callable[[], bool]" = None) -> None:
+    """盯一个文件的变化，变了就调 on_change(新mtime)。阻塞运行，自己开线程用。
+
+    基线取启动时刻的 mtime —— 上一次会话遗留的文件不会被当成“刚发生”。
+    """
+    seen = file_stamp(path)
+    while True:
+        if should_stop is not None and should_stop():
+            return
+        time.sleep(max(0.05, float(interval)))
+        stamp = file_stamp(path)
+        if stamp > seen:
+            seen = stamp
+            try:
+                on_change(stamp)
+            except Exception:
+                pass
+
+
+def wait_until(check: "Callable[[], bool]", *, timeout: float = 60.0,
+               interval: float = 0.08) -> bool:
+    """等一个条件成立。超时返回 False。"""
+    deadline = time.time() + max(0.0, float(timeout))
+    while time.time() < deadline:
+        try:
+            if check():
+                return True
+        except Exception:
+            pass
+        time.sleep(max(0.01, float(interval)))
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+_OWNER_FILES: "Dict[str, str]" = {}
+
+
+def _caller_file(depth: int = 2) -> str:
+    """声明所在的源文件：相对于被解释的文件本身，而不是本库。"""
+    try:
+        frame = sys._getframe(depth)
+    except (AttributeError, ValueError):
+        frame = None
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename and os.path.abspath(filename) != os.path.abspath(__file__):
+            return os.path.abspath(filename)
+        frame = frame.f_back
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    return os.path.abspath(main_file) if main_file else os.getcwd()
+
+
+def _main_file() -> str:
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if main_file:
+        return os.path.abspath(main_file)
+    return os.path.abspath(__file__)
+
+
+def _slug(name: Any) -> str:
+    text = str(name or "").strip()
+    # 中文/非 ASCII 名字保留原样：它只是显示名，不参与 DSH 的工具名规则。
+    if text and not re.search(r"[A-Za-z0-9]", text):
+        return text
+    # 函数名 snake_case -> kebab-case（blackboard_open -> blackboard-open），
+    # 这是插件与工具对外的约定，不能因为一次重写就丢掉。
+    text = text.replace("_", "-").replace(" ", "-")
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
+    text = text.lower()
+    if not text:
+        text = "tool"
+    if not re.match(r"^[a-z]", text):
+        text = "t-" + text
+    return text
+
+
+def _raise_for_syntax_landmines(filename: str) -> None:
+    """在声明期就拦住「能 import 但行为诡异」的写法。
+
+    典型是：注释行用制表符画装饰线（``# ─── 入口 ───``），那一行的 U+2500 系列字符
+    属于 CJK 符号，Python 的行拼接规则会把下一行并进同一逻辑行，于是
+    ``def main`` 的缩进错位，最后报出一个和真实原因毫无关系的
+    ``TypeError: 'str' object is not callable``，还指向错误的行号。
+    在这里提前说清楚，比让 agent 事后猜强得多。
+    """
+    try:
+        with open(filename, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            continue
+        # 只查「注释里出现两个以上制表符区字符」
+        if len(re.findall(r"[\u2500-\u257f]", stripped)) >= 2:
+            WARNINGS.append(
+                "%s:%d 注释里用了制表符装饰线（─ │ 等）。这类字符会让 Python 把下一行"
+                "并进同一逻辑行，导致后面 def 的缩进错位、报出与真实原因无关的 "
+                "'str' object is not callable。请换成普通字符，例如 '# --- 入口 ---'。"
+                % (os.path.basename(filename), index + 1)
+            )
+            break
+
+
+def _split_doc(doc: Optional[str]) -> "tuple[str, Dict[str, str]]":
+    """把 docstring 拆成「首行摘要」和 Args 段里的参数说明。"""
+    if not doc:
+        return "", {}
+    lines = doc.strip().splitlines()
+    summary = ""
+    for line in lines:
+        text = line.strip()
+        if text:
+            summary = text
+            break
+    params: Dict[str, str] = {}
+    in_args = False
+    for line in lines:
+        if re.match(r"^\s*(?:Args|Arguments|Parameters|参数)\s*:\s*$", line):
+            in_args = True
+            continue
+        match = re.match(r"^\s*:param\s+(\w+)\s*:\s*(.*)$", line)
+        if match:
+            params[match.group(1)] = match.group(2).strip()
+            continue
+        if not in_args:
+            continue
+        if line.strip() == "" or not line.startswith((" ", "\t")):
+            in_args = False
+            continue
+        match = re.match(r"^\s+([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s*:\s*(.*)$", line)
+        if match and match.group(1) not in params:
+            params[match.group(1)] = match.group(2).strip()
+    return summary, params
+
+
+def _is_context_annotation(annotation: Any) -> bool:
+    if annotation is ToolContext:
+        return True
+    return getattr(annotation, "__name__", "") == "ToolContext"
+
+
+def _build_schema(fn: Callable[..., Any], name: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    hints = _resolved_hints(fn)
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        signature = None
+    _, param_docs = _split_doc(getattr(fn, "__doc__", None))
+    properties: Dict[str, Any] = {}
+    required: "List[str]" = []
+    if signature is not None:
+        for parameter_name, parameter in signature.parameters.items():
+            if parameter_name in ("ctx", "context") and parameter.default is inspect.Parameter.empty:
+                continue
+            annotation = hints.get(parameter_name, parameter.annotation)
+            if _is_context_annotation(annotation):
+                continue
+            if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            schema = _annotation_schema(annotation)
+            if parameter_name in param_docs:
+                schema = dict(schema)
+                schema["description"] = param_docs[parameter_name]
+            if parameter.default is not inspect.Parameter.empty and parameter.default is not None:
+                schema = dict(schema)
+                schema["default"] = _jsonable(parameter.default)
+            properties[parameter_name] = schema
+            if parameter.default is inspect.Parameter.empty:
+                required.append(parameter_name)
+    for key, value in (overrides or {}).items():
+        merged = dict(properties.get(key, {}))
+        merged.update(value or {})
+        properties[key] = merged
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def register(
+    fn: Optional[Callable[..., Any]] = None,
+    *,
+    name: Optional[str] = None,
+    description: str = "",
+    parameters: Optional[Dict[str, Any]] = None,
+    schema: Optional[Dict[str, Any]] = None,
+    timeout: int = 120,
+):
+    """声明一个工具。可以直接当装饰器用：
+
+        @register(description="把两数相加", timeout=30)
+        def add(a: int, b: int) -> dict: ...
+
+    Args:
+        name: 覆盖工具名（默认取函数名的 kebab-case）。
+        description: 给大脑看的说明；不给就取 docstring 首行。
+        parameters: 单个参数的 schema 覆盖，例如 ``{"q": {"description": "..."}}``。
+        schema: 整份 JSON Schema 覆盖。
+        timeout: 单次调用超时（秒），上限 3600。
+    """
+
+    def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
+        tool_name = _slug(name or getattr(target, "__name__", "tool"))
+        summary_text, _ = _split_doc(getattr(target, "__doc__", None))
+        built = dict(schema) if schema else _build_schema(target, tool_name, parameters)
+        TOOLS[tool_name] = {
+            "name": tool_name,
+            "description": description or summary_text or tool_name,
+            "parameters": built,
+            "timeoutMs": int(max(1, min(3600, timeout)) * 1000),
+            "function": target,
+        }
+        _OWNER_FILES["tool:" + tool_name] = _caller_file(3)
+        try:
+            target.__pytools_tool__ = tool_name  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return target
+
+    if fn is not None and callable(fn):
+        return decorate(fn)
+    return decorate
+
+
+def skill(
+    name: Optional[str] = None,
+    *,
+    description: str = "",
+    body: Any = None,
+    when_to_use: Optional[str] = None,
+    resources: Optional[Iterable[str]] = None,
+    path: Optional[str] = None,
+):
+    """声明一个技能（markdown 正文）。
+
+    两种写法，**不要混用**：
+
+    .. code-block:: python
+
+        # 写法一：装饰器（正文来自函数返回值）
+        @skill("查表规范", description="何时查表、怎么查")
+        def lookup_guide() -> str:
+            return "# 查表规范\\n..."
+
+        # 写法二：直接给正文（不是装饰器！）
+        skill("查表规范", description="...", body="# 查表规范\\n...")
+
+    ``body=`` / ``path=`` 时本函数**直接登记并返回 ``None``**；此时再在它前面加
+    ``@`` 就会得到 ``TypeError: 'str' object is not callable`` —— 新版会当场
+    指出这一点，而不是让 Python 报一个看不懂的类型错误。
+    """
+    if name is None:
+        name = "skill"
+
+    def decorate(target: Any) -> Any:
+        resolved = _slug(name or getattr(target, "__name__", None) or "skill")
+        body_ref: Optional[str] = None
+        if isinstance(target, str):
+            content: Optional[str] = target
+        elif callable(target):
+            body_ref = _callable_ref(target)
+            content = None
+        else:
+            content = None
+        description_text = description or ""
+        if callable(target) and not description_text:
+            summary, _ = _split_doc(getattr(target, "__doc__", None))
+            description_text = summary
+        resolved_path = path
+        if resolved_path and not os.path.isabs(resolved_path):
+            resolved_path = os.path.join(os.path.dirname(_main_file()), resolved_path)
+        SKILLS[resolved] = {
+            "name": resolved,
+            "description": description_text or resolved,
+            "whenToUse": when_to_use,
+            "body": content,
+            "bodyFrom": body_ref,
+            "path": resolved_path,
+            "resources": list(resources or []),
+        }
+        _OWNER_FILES["skill:" + resolved] = _caller_file(3)
+        if callable(target):
+            try:
+                target.__pytools_skill__ = resolved  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+        return target
+
+    if body is not None or path is not None:
+        content = body
+        if isinstance(content, str) and content.lstrip().startswith("#"):
+            # 判断是不是被误当成装饰器用了：body 已经给了，说明这是最终调用。
+            decorate("" if content is None else content)
+        else:
+            decorate(content if isinstance(content, str) else "")
+        WARNINGS.append(
+            "skill(%r)：body=/path= 形式是「直接登记」，返回 None，不能再当前面的 @装饰器；"
+            "如果需要装饰器写法，请去掉 body=/path= 并把正文放在函数里 return。" % name
+        )
+        return None
+    return decorate
+
+
+def describe(description: str = "", tags: Optional[Iterable[str]] = None) -> None:
+    """给这个文件写一句总说明和几个标签（给大脑看的名片）。"""
+    FILE_INFO["description"] = str(description or "")
+    if tags is not None:
+        FILE_INFO["tags"] = [str(item) for item in tags]
+
+
+def _callable_ref(fn: Callable[..., Any]) -> str:
+    module = getattr(fn, "__module__", None) or "__main__"
+    qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "body"))
+    return module + ":" + qualname
+
+
+def _resolve_ref(reference: str) -> Any:
+    module_name, _, qualname = reference.partition(":")
+    module = sys.modules.get(module_name) or sys.modules.get("__main__")
+    target: Any = module
+    for part in (qualname or "").split("."):
+        if not part or target is None:
+            break
+        try:
+            target = getattr(target, part)
+        except AttributeError:
+            return None
+    return target
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 五、执行一次调用
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _coerce(value: Any, annotation: Any) -> Any:
+    """按类型注解做温和转换（模型给 "3" 而注解是 int 时转一下）。"""
+    if annotation is inspect.Parameter.empty or value is None:
+        return value
+    if isinstance(annotation, str):
+        base = _ANNOTATION_TOKENS.get(annotation.strip())
+        annotation = base if base is not None else annotation
+    try:
+        if annotation is bool and isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if annotation is int and isinstance(value, str):
+            return int(value)
+        if annotation is float and isinstance(value, (str, int)):
+            return float(value)
+        if annotation is str and not isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+    except (TypeError, ValueError):
+        return value
+    return value
+
+
+def _call_with(fn: Callable[..., Any], arguments: Dict[str, Any], hints: Dict[str, Any]) -> Any:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**arguments)
+    kwargs: Dict[str, Any] = {}
+    accepts_extra = False
+    for parameter_name, parameter in signature.parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            accepts_extra = True
+            continue
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            continue
+        if parameter_name in arguments:
+            kwargs[parameter_name] = _coerce(arguments[parameter_name], hints.get(parameter_name, parameter.annotation))
+    if accepts_extra:
+        for key, value in arguments.items():
+            kwargs.setdefault(key, value)
+    return fn(**kwargs)
+
+
+def _invoke(entry: Dict[str, Any], arguments: Dict[str, Any], ctx: ToolContext) -> Any:
+    fn = entry.get("function")
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        signature = None
+    hints = _resolved_hints(fn)
+    if signature is not None:
+        for parameter_name, parameter in signature.parameters.items():
+            annotation = hints.get(parameter_name, parameter.annotation)
+            wants = parameter_name in ("ctx", "context") or _is_context_annotation(annotation)
+            if parameter_name in ("ctx", "context") and parameter.default is inspect.Parameter.empty:
+                wants = True
+            if wants and parameter_name not in arguments:
+                merged = dict(arguments)
+                merged[parameter_name] = ctx
+                return _call_with(fn, merged, hints)
+    return _call_with(fn, arguments, hints)
+
+
+def _handle_call() -> int:
+    """``python file.py __pytools_call__``：执行一次调用。"""
+    call_file = os.environ.get(_ENV_CALL_FILE) or ""
+    result_file = os.environ.get(_ENV_RESULT_FILE) or ""
+    stream_file = os.environ.get(_ENV_STREAM_FILE) or None
+    reply_file = os.environ.get(_ENV_REPLY_FILE) or None
+    if not call_file or not os.path.exists(call_file):
+        print("pytools: missing call frame (%s)" % _ENV_CALL_FILE, file=sys.stderr)
+        return 2
+    if not result_file:
+        result_file = os.path.join(os.path.dirname(os.path.abspath(call_file)), "pytools_result.json")
+    try:
+        frame = _read_json_file(call_file)
+    except Exception as error:
+        print("pytools: unreadable call frame: %s" % error, file=sys.stderr)
+        return 2
+    protocol = str(frame.get("protocol") or PROTOCOL)
+    if protocol not in _COMPAT_PROTOCOLS:
+        print("pytools: 协议版本 %r 不认识（支持 %s）" % (protocol, ", ".join(_COMPAT_PROTOCOLS)), file=sys.stderr)
+        return 2
+    ctx = ToolContext(frame=frame, stream_path=stream_file, reply_path=reply_file)
+    ToolContext._current = ctx
+    started = time.time()
+    payload: Dict[str, Any] = {
+        "protocol": PROTOCOL,
+        "callId": frame.get("callId"),
+        "ok": False,
+        "tool": frame.get("tool"),
+        "startedAt": started,
+    }
+    try:
+        tool_name = str(frame.get("tool") or "")
+        entry = TOOLS.get(tool_name)
+        if entry is None:
+            raise KeyError("未注册的工具 %r（本文件声明了：%s）" % (tool_name, ", ".join(TOOLS) or "（无）"))
+        value = _invoke(entry, dict(frame.get("arguments") or {}), ctx)
+        payload["ok"] = True
+        payload["value"] = _jsonable(value)
+    except SystemExit as error:
+        code = error.code if error.code is not None else 0
+        payload["ok"] = code in (0, None)
+        payload["value"] = None
+        if not payload["ok"]:
+            payload["error"] = {"type": "SystemExit", "message": "sys.exit(%r)" % (code,)}
+    except BaseException as error:  # noqa: BLE001 —— 原样交给大脑，附完整 traceback
+        payload["ok"] = False
+        payload["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
+    finally:
+        payload["durationMs"] = int((time.time() - started) * 1000)
+        payload["events"] = len(ctx.events)
+        ctx.emit({"ok": bool(payload.get("ok"))}, kind="done")
+        ctx.close()
+        ToolContext._current = None
+        try:
+            _atomic_write_text(result_file, json.dumps(payload, ensure_ascii=False))
+        except OSError as error:
+            print("pytools: 写结果帧失败：%s" % error, file=sys.stderr)
+            return 3
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 六、常驻会话（手一直在听）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def serve(stdin=None, stdout=None) -> int:
+    """常驻模式：从 stdin 一行一条读指令，向 stdout 一行一条回帧。
+
+    指令（JSON 一行）：
+
+        {"id": "1", "op": "call", "tool": "render", "arguments": {...}}
+        {"id": "2", "op": "ping"}
+        {"id": "3", "op": "manifest"}
+        {"id": "4", "op": "shutdown"}
+
+    回帧（JSON 一行）：
+
+        {"id": "1", "kind": "result", "ok": true, "value": ...}
+        {"id": "1", "kind": "event", "payload": ...}        （执行中随时推）
+        {"id": "1", "kind": "ask", "askId": "...", "question": "..."}
+        {"id": "1", "kind": "progress", "value": 0.5}
+
+    答复 ``ask``：下一行写 ``{"op": "reply", "askId": "...", "answer": ...}``。
+
+    这样多个调用可以交错进来（各自带 id），互不串号；同一个进程可以一直听。
+    """
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    emit_lock = __import__("threading").Lock()
+
+    def send(frame: Dict[str, Any]) -> None:
+        with emit_lock:
+            stdout.write(json.dumps(_jsonable(frame), ensure_ascii=False) + "\n")
+            stdout.flush()
+
+    pending_replies: Dict[str, Any] = {}
+    reply_lock = __import__("threading").Lock()
+
+    class ServeContext(ToolContext):
+        """常驻会话里的上下文：帧走 stdout，而不是文件。"""
+
+    def run_one(request: Dict[str, Any]) -> None:
+        request_id = request.get("id")
+        tool_name = str(request.get("tool") or "")
+        entry = TOOLS.get(tool_name)
+        if entry is None:
+            send({"id": request_id, "kind": "result", "ok": False,
+                  "error": {"type": "KeyError", "message": "未注册的工具 %r" % tool_name}})
+            return
+        ctx = ServeContext(frame={"callId": request_id, "tool": tool_name,
+                                  "arguments": request.get("arguments") or {},
+                                  "requestId": request_id})
+        ctx._seq_emit = lambda payload, kind="data", _c=ctx: send(  # type: ignore[attr-defined]
+            {"id": request_id, "kind": kind, "payload": _jsonable(payload)})
+        ToolContext._current = ctx
+        started = time.time()
+        try:
+            value = _invoke(entry, dict(request.get("arguments") or {}), ctx)
+            send({"id": request_id, "kind": "result", "ok": True, "value": _jsonable(value),
+                  "durationMs": int((time.time() - started) * 1000)})
+        except BaseException as error:  # noqa: BLE001
+            send({"id": request_id, "kind": "result", "ok": False,
+                  "error": {"type": type(error).__name__, "message": str(error),
+                            "traceback": traceback.format_exc()}})
+        finally:
+            ToolContext._current = None
+
+    # 覆盖 ServeContext.emit 走 stdout（而不是文件）
+    _orig_emit = ToolContext.emit
+
+    def emit_to_stdout(self, payload, /, *, kind="data"):
+        sender = getattr(self, "_seq_emit", None)
+        if callable(sender) and isinstance(self, ServeContext):
+            sender(payload, kind)
+            return
+        _orig_emit(self, payload, kind=kind)
+
+    ToolContext.emit = emit_to_stdout  # type: ignore[assignment]
+    try:
+        send({"kind": "ready", "pid": os.getpid(), "protocol": PROTOCOL,
+              "version": VERSION, "tools": sorted(TOOLS)})
+        worker_threads: List[Any] = []
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except ValueError:
+                send({"kind": "error", "error": {"type": "ValueError", "message": "不是合法 JSON"}})
+                continue
+            op = str(request.get("op") or "call")
+            if op == "ping":
+                send({"id": request.get("id"), "kind": "pong", "t": time.time()})
+            elif op == "manifest":
+                send({"id": request.get("id"), "kind": "manifest", "value": _manifest()})
+            elif op == "reply":
+                with reply_lock:
+                    pending_replies[str(request.get("askId"))] = request.get("answer")
+            elif op == "shutdown":
+                send({"kind": "bye"})
+                break
+            elif op == "call":
+                thread = __import__("threading").Thread(target=run_one, args=(request,), daemon=True)
+                thread.start()
+                worker_threads.append(thread)
+            else:
+                send({"id": request.get("id"), "kind": "error",
+                      "error": {"type": "ValueError", "message": "不认识的 op %r" % op}})
+        for thread in worker_threads:
+            thread.join(timeout=5.0)
+    finally:
+        ToolContext.emit = _orig_emit  # type: ignore[assignment]
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 七、清单、技能正文、自检
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _skill_body(entry: Dict[str, Any]) -> str:
+    if entry.get("body") is not None:
+        return str(entry["body"])
+    ref = entry.get("bodyFrom")
+    if ref:
+        fn = _resolve_ref(str(ref))
+        if callable(fn):
+            try:
+                return str(fn())
+            except Exception as error:  # noqa: BLE001
+                return "# 技能正文读取失败\n\n%s: %s" % (type(error).__name__, error)
+    path = entry.get("path")
+    if path and os.path.isfile(str(path)):
+        try:
+            with open(str(path), "r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as error:
+            return "# 技能文件读取失败：%s" % error
+    return ""
+
+
+def _manifest() -> Dict[str, Any]:
+    tools = []
+    for name, entry in TOOLS.items():
+        tools.append({
+            "name": name,
+            "description": entry.get("description") or name,
+            "parameters": entry.get("parameters") or {"type": "object", "properties": {}},
+            "timeoutMs": entry.get("timeoutMs", 120000),
+            "output": None,
+        })
+    skills = []
+    for name, entry in SKILLS.items():
+        skills.append({
+            "name": name,
+            "description": entry.get("description") or name,
+            "whenToUse": entry.get("whenToUse"),
+        })
+    return {
+        "protocol": PROTOCOL,
+        "python": platform.python_version(),
+        "executable": sys.executable,
+        "file": _main_file(),
+        "info": dict(FILE_INFO),
+        "tools": tools,
+        "skills": skills,
+        "warnings": list(WARNINGS),
+        "followLifecycle": bool(LIFECYCLE["follow"]),
+    }
+
+
+def doctor(root: Optional[str] = None) -> Dict[str, Any]:
+    """自检：把「为什么这个环境能跑 / 为什么跑不起来」一次说清。"""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path_entries = [str(item) for item in sys.path if item]
+    findings: Dict[str, Any] = {
+        "protocol": PROTOCOL,
+        "clientVersion": VERSION,
+        "python": platform.python_version(),
+        "pythonOk": sys.version_info >= (3, 8),
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "clientDir": here,
+        "clientDirOnPath": here in path_entries,
+        "cwd": os.getcwd(),
+        "env": {
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "PYTOOLS_CLIENT_DIR": os.environ.get("PYTOOLS_CLIENT_DIR", ""),
+            "PYTOOLS_HOST": os.environ.get("PYTOOLS_HOST", ""),
+            "PYTOOLS_HOST_VERSION": os.environ.get("PYTOOLS_HOST_VERSION", ""),
+        },
+        "importable": importlib.util.find_spec("pytools_client") is not None,
+        "tools": sorted(TOOLS),
+        "skills": sorted(SKILLS),
+        "warnings": list(WARNINGS),
+    }
+    if root and os.path.isdir(root):
+        findings["files"] = sorted(
+            os.path.join(root, name) for name in os.listdir(root) if name.endswith(".py")
+        )
+    problems: List[str] = []
+    if not findings["pythonOk"]:
+        problems.append("Python 版本低于 3.8：请换一个 3.8+ 的解释器（当前 %s）。" % platform.python_version())
+    if not findings["importable"]:
+        problems.append("当前解释器 import 不到 pytools_client：检查 PYTHONPATH 或把本文件目录加进 sys.path。")
+    if WARNINGS:
+        problems.append("声明期发现 %d 条写法问题，见 warnings。" % len(WARNINGS))
+    findings["problems"] = problems
+    findings["ok"] = not problems
+    return findings
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 八、命令行入口
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """argparse 之前的手工解析：DSH 插件只认这几种参数。"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    # 每次声明先体检一遍「能 import 但行为诡异」的写法（如 CJK 装饰线吞行）
+    _raise_for_syntax_landmines(_main_file())
+    if args[:1] == ["--manifest"]:
+        print(json.dumps(_manifest(), ensure_ascii=False))
+        return 0
+    if args[:1] == ["--list"]:
+        for name, entry in TOOLS.items():
+            print("tool\t%s\t%s" % (name, entry.get("description") or name))
+        for name, entry in SKILLS.items():
+            print("skill\t%s\t%s" % (name, entry.get("description") or name))
+        return 0
+    if args[:1] == ["--skill"]:
+        name = args[1] if len(args) > 1 else ""
+        entry = SKILLS.get(name)
+        if entry is None:
+            print("pytools: 没有技能 %r（有：%s）" % (name, ", ".join(SKILLS) or "（无）"), file=sys.stderr)
+            return 1
+        print(_skill_body(entry))
+        return 0
+    if args[:1] == ["--doctor"]:
+        print(json.dumps(doctor(_main_file_dir()), ensure_ascii=False, indent=2))
+        return 0
+    if args[:1] == [_CLI_SUBCOMMAND]:
+        return _handle_call()
+    if args[:1] == [_SERVE_SUBCOMMAND]:
+        return serve()
+    # 默认：名片
+    print("Python Tools file: %s" % _main_file())
+    print("python %s  (%s)" % (platform.python_version(), sys.executable))
+    if FILE_INFO.get("description"):
+        print(FILE_INFO["description"])
+    print("tools (%d):" % len(TOOLS))
+    for name, entry in TOOLS.items():
+        print("  - %s: %s" % (name, entry.get("description") or name))
+    print("skills (%d):" % len(SKILLS))
+    for name, entry in SKILLS.items():
+        print("  - %s: %s" % (name, entry.get("description") or name))
+    for warning in WARNINGS:
+        print("WARN: %s" % warning, file=sys.stderr)
+    return 0
+
+
+def _main_file_dir() -> str:
+    try:
+        return os.path.dirname(_main_file())
+    except Exception:
+        return os.getcwd()
+
+
+def _cli() -> int:
+    """``pip install`` 后的命令行入口（pyproject 的 [project.scripts]）。"""
+    return main()
+
+
+__all__ += ["serve", "doctor", "WARNINGS"]

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytools-client"
+version = "2.0.0"
+description = "神经：DSH 与 Python 之间只传指令和数据的通道（可独立 import，无需插件注入路径）"
+readme = "README-PYPI.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "DSH Python Tools" }]
+keywords = ["dsh", "python-tools", "rpc", "tools", "agent"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+# 运行期零依赖：只用标准库。这是刻意的 —— 神经不该挑食。
+dependencies = []
+
+[project.scripts]
+pytools-client = "pytools_client:_cli"
+
+[tool.setuptools]
+py-modules = ["pytools_client"]
